@@ -307,6 +307,91 @@ function detectHtmlErrorMessage(output: string): string {
 	return 'Installer URL returned an HTML page instead of an installation script. The service may be temporarily unavailable or not accessible from your location. Visit https://claude.ai for more information.';
 }
 
+type ExecResult = Awaited<ReturnType<typeof exec>>;
+
+/**
+ * Run a Windows .ps1 installer through PowerShell (download + run, no cmd/shell piping)
+ */
+async function runPowerShellInstaller(
+	agentName: string,
+	url: string,
+	version: string | undefined,
+	timeout: number,
+	env: Record<string, string> | undefined,
+	versionEnvVar: string | undefined
+): Promise<ExecResult> {
+	if (!url.startsWith('https://')) {
+		throw new AgentInstallationError(agentName, `Installer URL must use HTTPS: ${url}`);
+	}
+	const isPinnedVersion = !!version && !['latest', 'stable'].includes(version.toLowerCase());
+	if (isPinnedVersion && !isValidSemanticVersion(version)) {
+		throw new AgentInstallationError(
+			agentName,
+			`Invalid version format: "${version}". Expected semantic version (e.g., "2.0.30"), "latest", or "stable".`
+		);
+	}
+	const psEnv: Record<string, string> = { ...(process.env as Record<string, string>), ...env };
+	if (versionEnvVar && isPinnedVersion) {
+		psEnv[versionEnvVar] = version;
+	}
+	logger.debug('Executing PowerShell installer', {
+		agentName,
+		executable: 'powershell',
+		steps: ['download', 'run'],
+	});
+	return exec('powershell', buildPowerShellInstallerArgs(url), { timeout, env: psEnv, shell: false });
+}
+
+/**
+ * Run the platform's shell installer command (curl | bash, or install.cmd on Windows)
+ */
+async function runShellInstaller(
+	agentName: string,
+	installerUrls: PlatformInstallerUrls,
+	version: string | undefined,
+	platform: 'macOS' | 'windows' | 'linux',
+	timeout: number,
+	env: Record<string, string> | undefined,
+	installFlags: string[] | undefined
+): Promise<ExecResult> {
+	const command = buildInstallerCommand(agentName, installerUrls, version, platform, installFlags);
+
+	logger.debug('Executing installer command', {
+		agentName,
+		platform,
+		// Don't log full command (may contain sensitive URLs)
+	});
+
+	try {
+		let result = await exec(command, [], {
+			timeout,
+			env,
+			shell: true, // Required for piped commands (curl | bash)
+		});
+
+		// Windows-specific: auto-fix PowerShell execution policy and retry once
+		if (result.code !== 0 && platform === 'windows') {
+			const combinedOutput = `${result.stderr || ''} ${result.stdout || ''}`;
+			if (isExecutionPolicyError(combinedOutput)) {
+				logger.info('PowerShell execution policy is blocking installation. Attempting auto-fix...');
+				const fixed = await fixWindowsExecutionPolicy();
+				if (fixed) {
+					logger.info('Execution policy updated. Retrying installation...');
+					result = await exec(command, [], { timeout, env, shell: true });
+				} else {
+					logger.warn('Could not update execution policy automatically. Manual fix required.');
+				}
+			}
+		}
+		return result;
+	} finally {
+		// The command string's trailing `del` is skipped when an earlier step fails
+		if (platform === 'windows') {
+			await rm(path.join(process.cwd(), 'install.cmd'), { force: true }).catch(() => undefined);
+		}
+	}
+}
+
 /**
  * Install agent using native platform installer
  * Detects platform and executes appropriate installation script
@@ -344,71 +429,9 @@ export async function installNativeAgent(
 	try {
 		const windowsUrl = installerUrls.windows;
 		const usePowerShell = platform === 'windows' && isPowerShellInstallerUrl(windowsUrl);
-		let result: Awaited<ReturnType<typeof exec>>;
-
-		if (usePowerShell) {
-			if (!windowsUrl.startsWith('https://')) {
-				throw new AgentInstallationError(agentName, `Installer URL must use HTTPS: ${windowsUrl}`);
-			}
-			if (version) {
-				const isChannel = ['latest', 'stable'].includes(version.toLowerCase());
-				if (!isChannel && !isValidSemanticVersion(version)) {
-					throw new AgentInstallationError(
-						agentName,
-						`Invalid version format: "${version}". Expected semantic version (e.g., "2.0.30"), "latest", or "stable".`
-					);
-				}
-			}
-			const psArgs = buildPowerShellInstallerArgs(windowsUrl);
-			const psEnv: Record<string, string> = { ...(process.env as Record<string, string>), ...env };
-			if (options?.versionEnvVar && version && !['latest', 'stable'].includes(version.toLowerCase())) {
-				psEnv[options.versionEnvVar] = version;
-			}
-			logger.debug('Executing PowerShell installer', {
-				agentName,
-				executable: 'powershell',
-				steps: ['download', 'run'],
-			});
-			result = await exec('powershell', psArgs, { timeout, env: psEnv, shell: false });
-		} else {
-			// Build installer command
-			const command = buildInstallerCommand(agentName, installerUrls, version, platform, options?.installFlags);
-
-			logger.debug('Executing installer command', {
-				agentName,
-				platform,
-				// Don't log full command (may contain sensitive URLs)
-			});
-
-			try {
-				// Execute installer
-				result = await exec(command, [], {
-					timeout,
-					env,
-					shell: true, // Required for piped commands (curl | bash)
-				});
-
-				// Windows-specific: auto-fix PowerShell execution policy and retry once
-				if (result.code !== 0 && platform === 'windows') {
-					const combinedOutput = `${result.stderr || ''} ${result.stdout || ''}`;
-					if (isExecutionPolicyError(combinedOutput)) {
-						logger.info('PowerShell execution policy is blocking installation. Attempting auto-fix...');
-						const fixed = await fixWindowsExecutionPolicy();
-						if (fixed) {
-							logger.info('Execution policy updated. Retrying installation...');
-							result = await exec(command, [], { timeout, env, shell: true });
-						} else {
-							logger.warn('Could not update execution policy automatically. Manual fix required.');
-						}
-					}
-				}
-			} finally {
-				// The command string's trailing `del` is skipped when an earlier step fails
-				if (platform === 'windows') {
-					await rm(path.join(process.cwd(), 'install.cmd'), { force: true }).catch(() => undefined);
-				}
-			}
-		}
+		const result = usePowerShell
+			? await runPowerShellInstaller(agentName, windowsUrl, version, timeout, env, options?.versionEnvVar)
+			: await runShellInstaller(agentName, installerUrls, version, platform, timeout, env, options?.installFlags);
 
 		// Check if installation succeeded
 		if (result.code !== 0) {
